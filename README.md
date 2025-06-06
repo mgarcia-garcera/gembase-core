@@ -8,4 +8,4 @@ I will make evolve this README as I start adding scripts and making them work in
 2025.06.05. I decided that I am converting my scripts to build the gembase + build the core-genome & the pan-genome to python, with the help of MissGPT.
 
 
-
+2025.06.06. Connection to git
