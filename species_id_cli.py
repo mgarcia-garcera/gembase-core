@@ -1,5 +1,5 @@
 import argparse
-from species_identifier import GembaseFunctions
+from GembaseFunctions import SpeciesIdentifier
 
 def process_fasta(file_path, si: SpeciesIdentifier):
     output_path = file_path.rsplit('.', 1)[0] + ".renamed.fasta"
@@ -41,17 +41,23 @@ def process_fasta(file_path, si: SpeciesIdentifier):
                 outfile.write(seq_line + '\n')
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate species-strain identifiers.")
-    parser.add_argument("fasta_files", nargs="+", help="FASTA file(s) to process")
-    parser.add_argument("--history", required=True, help="Path to history TSV file")
-    parser.add_argument("--reference", required=True, help="Path to species reference TSV file")
+    parser = argparse.ArgumentParser(
+        description="Assigns an identifier to a species assembly in a FASTA file."
+    )
+    parser.add_argument("fasta", help="Path to the input FASTA file (multi-FASTA allowed, same assembly/species expected)")
+    parser.add_argument("-r", "--reference", default="species_reference.tsv", help="Path to reference file (species code)")
+    parser.add_argument("-hi", "--history", default="species_history.tsv", help="Path to history file (species+strain identifiers)")
+    parser.add_argument("-o", "--output", default="renamed_fastas", help="Output directory for renamed FASTA files")
 
     args = parser.parse_args()
 
-    si = SpeciesIdentifier(args.history, args.reference)
+    identifier = SpeciesIdentifier(
+        reference_file=args.reference,
+        history_file=args.history,
+        output_dir=args.output
+    )
 
-    for fasta_file in args.fasta_files:
-        process_fasta(fasta_file, si)
+    identifier.assign_identifier_to_fasta(args.fasta)
 
 if __name__ == "__main__":
     main()
