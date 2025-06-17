@@ -94,7 +94,6 @@ def process_fasta(input_file, features, file_prefix, suffix_map, nuc_dir, rna_di
             else:
                 seq_lines.append(line)
 
-        # Last record
         if header is not None:
             old_locus = header.split()[0].lstrip(">")
             if old_locus in features:
@@ -123,7 +122,7 @@ def process_fasta(input_file, features, file_prefix, suffix_map, nuc_dir, rna_di
 
 def process_faa(input_file, features, file_prefix, protein_dir, debug=False):
     outfile = os.path.join(protein_dir, f"{file_prefix}.faa")
-    open(outfile, 'w').close()  # Clear if exists
+    open(outfile, 'w').close()
     with open(input_file) as handle:
         seq_lines = []
         header = None
@@ -152,7 +151,6 @@ def process_faa(input_file, features, file_prefix, protein_dir, debug=False):
             else:
                 seq_lines.append(line)
 
-        # Last protein record
         if header is not None:
             old_locus = header.split()[0].lstrip(">")
             if old_locus in features:
@@ -171,15 +169,16 @@ def main(tsv_file, ffn_file, faa_file, out_dir, debug=False):
 
     suffix_map = {
         'cds': '.nuc',
-        'Genesrna',
+        'rrna': '.rrna',
         'trna': '.ttrna',
         'tmrna': '.tmrna',
-        'ncrna': '.ncrna'Proteins    'ncrna-region': '.ncrna'
+        'ncrna': '.ncrna',
+        'ncrna-region': '.ncrna'
     }
 
-    nuc_dir = os.path.join(out_dir, "nucleotide")
+    nuc_dir = os.path.join(out_dir, "Genes")
     rna_dir = os.path.join(out_dir, "RNA")
-    protein_dir = os.path.join(out_dir, "protein")
+    protein_dir = os.path.join(out_dir, "proteins")
     os.makedirs(nuc_dir, exist_ok=True)
     os.makedirs(rna_dir, exist_ok=True)
     os.makedirs(protein_dir, exist_ok=True)
@@ -196,14 +195,18 @@ def main(tsv_file, ffn_file, faa_file, out_dir, debug=False):
     print(f"[INFO] Completed. Files written to:")
     print(f"       {nuc_dir}  (for .nuc)")
     print(f"       {rna_dir}  (for .rrna, .ttrna, etc.)")
-    print(f"       {protein_dir}  --(for protein FASTA)")
+    print(f"       {protein_dir}  (for protein FASTA)")
 
 if __name__ == "__main__":
-    parse--r = argparse.ArgumentParser(description="Rewrite FFN & FAA FASTA --headers from TSV metadata and organize by type.")
-    parser"o",.--add_argument("tsv", help="Renamed TSV input file")
-    parser.add_argument("ffn", help="FFN nucleotide FASTA file")
-    parser.add_argument("faa", help="FAA protein FASTA file")
-    parser.add_argument("outdir", help="Output directory where subfolders will be created")
+    parser = argparse.ArgumentParser(description="Rewrite FFN & FAA FASTA headers from TSV metadata and organize by type.")
+    parser.add_argument("--tsv", required=True, help="Renamed TSV input file")
+    parser.add_argument("--ffn", required=True, help="FFN nucleotide FASTA file")
+    parser.add_argument("--faa", required=True, help="FAA protein FASTA file")
+    parser.add_argument("-o", "--outdir", required=True, help="Output directory where subfolders will be created")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    args = parser.parse_args()
+
+    main(args.tsv, args.ffn, args.faa, args.outdir, debug=args.debug)rs will be created")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
     args = parser.parse_args()
 
