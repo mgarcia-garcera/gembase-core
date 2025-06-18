@@ -31,4 +31,8 @@ I will make evolve this README as I start adding scripts and making them work in
 
 2025.06.17 Build a script that takes the FFN + FAA and reformats the headers to keep with the AABB.XXX.YYYY format.
 
+2025.06.17 Build a script that takes the replicon fasta and the summary txt and builds the .inf.
+
+2025.06.18 Transfer all functions to GembaseFunctions.py (GF), and build a script called gembases_builder which calls all the functions at GF and smoothly converts a fasta into a gembases.
+
 
