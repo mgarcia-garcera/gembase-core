@@ -7,11 +7,11 @@ import shutil
 from collections import defaultdict
 from Bio import SeqIO
 import warnings
+import warnings
 
 warnings.filterwarnings(
     "ignore",
-    message="The value of the smallest subnormal for <class 'numpy.float32'> type is zero.",
-    module="numpy._core.getlimits"
+    module="numpy"
 )
 
 def main():
@@ -37,6 +37,7 @@ def main():
     parser.add_argument("-s", "--subdirectories", nargs="*", default=['Replicons','Genes','Proteins','LSTINFO','RNA'], help="List of subdirectories to create. Default is 5 standard directories.")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
     parser.add_argument("-e", "--email", required=True, help="Email address for Entrez API")
+    parser.add_argument("--log", required=False, help="LogFile")
     
     args = parser.parse_args()
     
@@ -45,11 +46,27 @@ def main():
     tmpdir = os.path.join(args.output, "TMP")
     os.makedirs(tmpdir, exist_ok=True)
     
+    #create log file if not as argument
+    if not args.log:
+        logfile = GF.define_log_file(args.i, args.output) 
+    else:
+        logfile = args.log
+    
     identifier = GF.SpeciesIdentifier(
         reference_file=args.reference,
         history_file=args.history,
         output_dir=tmpdir
     )
+    id,tmpfasta=identifier.assign_identifier_to_fasta(args.i)
+    #check existance of logfile and kill if already finished
+    
+    if GF.check_gembases_output(logfile, id):
+        print("✅ Pipeline already completed Previously!")
+        sys.exit()
+    else:
+        print("❌ Pipeline did not complete successfully or log missing.")
+
+
     
     id,tmpfasta=identifier.assign_identifier_to_fasta(args.i)
     #With the re-named file, it runs bakta and reannotates.
@@ -57,6 +74,8 @@ def main():
     bakta_dir=os.path.join(tmpdir, id)
     bakta_check = GF.check_bakta_output_exists(bakta_dir, id)
     
+    
+        
     if bakta_check == 0:
         print("⚙️ Running Bakta...")
         GF.run_bakta(fasta_file=tmpfasta,output_dir=bakta_dir,prefix=id,threads=args.threads,db_path=args.db,force=args.force)
@@ -125,7 +144,6 @@ def main():
 
     
     features, file_prefix = GF.parse_tsv(out_tsv, debug=args.debug)
-
     print("\n========== HEADER CONSISTENCY CHECK ==========")
     ffn_headers = GF.parse_fasta_headers(FFNinput)
     GF.check_headers(features, ffn_headers, os.path.basename(FFNinput), debug=args.debug)
@@ -143,12 +161,13 @@ def main():
         'trna': '.trna',
         'tmrna': '.tmrna',
         'ncrna': '.ncrna',
-        'ncrna-region': '.ncrna'
+        'ncrna-region': '.ncrna',
+        'prt': '.prt'
     }
 
-    out_dirs = {'nuc': nuc_dir, 'rna': rna_dir}
+    out_dirs = {'nuc': nuc_dir, 'rna': rna_dir, 'prt' : protein_dir}
     count_by_type = defaultdict(int)
-
+    
     print(f"[INFO] Processing FFN file...")
     GF.process_ffn(FFNinput, features, file_prefix, suffix_map, out_dirs, count_by_type, debug=args.debug)
 
@@ -172,16 +191,17 @@ def main():
         INFfile = os.path.join(outdir_lstinfo, f"{id}{INFsuffix}")
         with open(INFfile, 'w') as out_f:
                 GF.process_txt_file(TXTinfile, strain_id, genus, species, strain_info, replicons, taxid, taxline, out_f)
-        print(f"✔️ Gembases entry for '{id}' performed successfully")
+        
         
     except Exception as e:
         print(f"❌ ERROR: {e}")
         sys.exit(1)
         
     ## 7. Cleanup
-
+    print(f"✔️ Gembases entry for '{id}' performed successfully")
     shutil.rmtree(bakta_dir)
     os.remove(tmpfasta)
+
 
 if __name__ == "__main__":
     main()

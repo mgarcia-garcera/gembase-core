@@ -9,8 +9,9 @@ import subprocess
 import shutil
 import sys
 from collections import defaultdict
+import pathlib
 from pathlib import Path
-
+import gzip
 def ensure_directories(base_dir, subdirs):
     for subdir in subdirs:
         full_path = os.path.join(base_dir, subdir)
@@ -45,14 +46,47 @@ def parse_accession_species_strain(orig_header):
     else:
         raise ValueError(f"Could not parse accession/species/strain from header: {orig_header}")
 
+def parse_accession_species_strain_draft(orig_header):
+    """
+    Extract accession, species, and strain. Strain can contain spaces.
+    """
+    match = re.match(r'^(?P<accession>\S+)\s+(?P<species>[A-Za-z]+ [a-z]+)\s+(?P<strain>.+?)(?:,|\||$)', orig_header)
+    if match:
+        return match.group("accession"), match.group("species"), match.group("strain").strip()
+    else:
+        raise ValueError(f"Could not parse accession/species/strain from header in this draft: {orig_header}")
+
 def parse_mag_header(orig_header):
     """
-    Specifically detect MAG format: accession MAG uncultured Genus sp. isolate Strain, ...
+    Detects if 'MAG' exists in the header.
+    If found, extract accession, Genus species, and strain.
+
+    Returns:
+        accession, species, strain  |  or  None if no MAG detected.
     """
-    match = re.match(r'^(?P<accession>\S+)\s+MAG uncultured (?P<genus>[A-Za-z]+) sp\. isolate (?P<strain>\S+)', orig_header)
-    if match:
-        return match.group("accession"), f"{match.group('genus')} sp.", match.group("strain")
-    return None
+    match = re.match(r'^(?P<accession>\S+)\s+(?P<desc>.+)', orig_header)
+    if not match:
+        return None
+
+    accession = match.group("accession")
+    desc = match.group("desc")
+
+    if "MAG" not in desc:
+        return None
+
+    # Extract first occurrence of Genus species (e.g., "Abiotrophia defectiva")
+    species_match = re.search(r'([A-Z][a-z]+)\s+(sp\.|[a-z]+)', desc)
+    if not species_match:
+        return None
+
+    genus = species_match.group(1)
+    species = species_match.group(2)
+    species_full = f"{genus} {species}"
+
+    # Everything AFTER that match is treated as strain (optional cleanup possible)
+    strain = desc[species_match.end():].strip() or "no_strain"
+
+    return accession, species_full, strain
 
 def reheader_fasta(original_fasta, bakta_fna, output_fasta):
     original_records = list(SeqIO.parse(original_fasta, "fasta"))
@@ -67,6 +101,7 @@ def reheader_fasta(original_fasta, bakta_fna, output_fasta):
     draft_counter = 1
 
     with open(output_fasta, "w") as out_f:
+
         for idx, (orig_rec, bakta_rec) in enumerate(zip(original_records, bakta_records), 1):
             if str(orig_rec.seq) != str(bakta_rec.seq):
                 raise ValueError(f"Sequence mismatch at sequence {idx}!")
@@ -76,7 +111,6 @@ def reheader_fasta(original_fasta, bakta_fna, output_fasta):
 
             # Check chromosome or plasmid first
             new_header_type = detect_chrom_or_plasmid(orig_rec.description, bakta_rec.description)
-
             if new_header_type == "chromosome":
                 accession, species, strain = parse_accession_species_strain(orig_rec.description)
                 header = f"{accession}.c{chrom_counter:03d} {species} {strain} |Complete chromosome| |{old_id}| |KEY:{key_id}|"
@@ -96,7 +130,7 @@ def reheader_fasta(original_fasta, bakta_fna, output_fasta):
                     header = f"{accession}.m{mag_counter:03d} {species} {strain} |Uncultured MAG| |{old_id}| |KEY:{key_id}|"
                     mag_counter += 1
                 else:
-                    accession, species, strain = parse_accession_species_strain(orig_rec.description)
+                    accession, species, strain = parse_accession_species_strain_draft(orig_rec.description)
                     header = f"{accession}.d{draft_counter:03d} {species} {strain} |{old_id}| |KEY:{key_id}|"
                     draft_counter += 1
 
@@ -254,13 +288,22 @@ class SpeciesIdentifier:
 
     def assign_identifier_to_fasta(self, fasta_path):
         # Extract species and strain info from the FIRST header
-        with open(fasta_path, 'r') as f:
-            for line in f:
-                if line.startswith('>'):
-                    genus, species, strain = self._extract_species_info(line)
-                    break
-            else:
-                raise ValueError("No FASTA header found in file.")
+        if fasta_path.endswith('.gz'):
+            with gzip.open(fasta_path, 'rt') as f:
+                for line in f:
+                    if line.startswith('>'):
+                        genus, species, strain = self._extract_species_info(line)
+                        break
+                    else:
+                        raise ValueError("No FASTA header found in file.")
+        else :
+            with self.open(fasta_path, 'r') as f:
+                for line in f:
+                    if line.startswith('>'):
+                        genus, species, strain = self._extract_species_info(line)
+                        break
+                else:
+                    raise ValueError("No FASTA header found in file.")
     
         species_key = f"{genus} {species}"            # species-level key
         strain_key = f"{species_key} {strain}"        # full strain key
@@ -288,21 +331,36 @@ class SpeciesIdentifier:
                 writer.writerow([identifier, strain_key])
     
         # Generate renamed FASTA
-        output_fasta = os.path.join(
-            self.output_dir,
-            os.path.basename(fasta_path).rsplit('.', 1)[0] + '.renamed.fasta'
-        )
-    
-        with open(fasta_path, 'r') as infile, open(output_fasta, 'w') as outfile:
-            for line in infile:
-                if line.startswith('>'):
-                    parts = line[1:].split(maxsplit=1)
-                    original_seq_id = parts[0]
-                    rest = parts[1] if len(parts) > 1 else ""
-                    new_header = f">{identifier} {rest.strip()} |OLD:{original_seq_id}|"
-                    outfile.write(new_header + '\n')
-                else:
-                    outfile.write(line)
+        if fasta_path.endswith('.gz'):
+            output_fasta = os.path.join(
+                self.output_dir,
+                os.path.basename(fasta_path).rsplit('.', 2)[0] + '.renamed.fasta'
+            )
+            with gzip.open(fasta_path, 'rt') as infile, open(output_fasta, 'w') as outfile:
+                for line in infile:
+                    if line.startswith('>'):
+                        parts = line[1:].split(maxsplit=1)
+                        original_seq_id = parts[0]
+                        rest = parts[1] if len(parts) > 1 else ""
+                        new_header = f">{identifier} {rest.strip()} |OLD:{original_seq_id}|"
+                        outfile.write(new_header + '\n')
+                    else:
+                        outfile.write(line)
+        else:
+            output_fasta = os.path.join(
+                self.output_dir,
+                os.path.basename(fasta_path).rsplit('.', 1)[0] + '.renamed.fasta'
+            )
+            with open(fasta_path, 'r') as infile, open(output_fasta, 'w') as outfile:
+                for line in infile:
+                    if line.startswith('>'):
+                        parts = line[1:].split(maxsplit=1)
+                        original_seq_id = parts[0]
+                        rest = parts[1] if len(parts) > 1 else ""
+                        new_header = f">{identifier} {rest.strip()} |OLD:{original_seq_id}|"
+                        outfile.write(new_header + '\n')
+                    else:
+                        outfile.write(line)
     
         print(f"[INFO] Created: {output_fasta}")
         print(f"[INFO] Identifier for assembly: {identifier} ({strain_key})")
@@ -340,7 +398,7 @@ def run_bakta(fasta_file, output_dir, prefix, threads=4, db_path=None, force=Fal
         "--output", output_dir,
         "--prefix", prefix,
         "--threads", str(threads),
-        fasta_file
+        fasta_file 
     ]
 
     print(f"[INFO] Running Bakta:\n{' '.join(cmd)}")
@@ -352,92 +410,6 @@ def run_bakta(fasta_file, output_dir, prefix, threads=4, db_path=None, force=Fal
         print(f"[ERROR] Bakta failed with return code {e.returncode}.")
         raise
 
-def detect_chrom_or_plasmid(orig_header, new_header):
-    is_complete = "[completeness=complete]" in new_header and "[topology=circular]" in new_header
-    if is_complete and "chromosome" in orig_header:
-        return "chromosome"
-    elif is_complete and "plasmid" in orig_header:
-        return "plasmid"
-    else:
-        return None
-
-def parse_old_id(orig_header):
-    match = re.search(r'\|(OLD:[^|]+)\|', orig_header)
-    if not match:
-        raise ValueError(f"Missing |OLD:...| identifier in header: {orig_header}")
-    return match.group(1)
-
-def parse_accession_species_strain(orig_header):
-    """
-    Extract accession, species, and strain. Strain can contain spaces.
-    """
-    match = re.match(r'^(?P<accession>\S+)\s+(?P<species>[A-Za-z]+ [a-z]+)\s+(?P<strain>.+?)(?:,|\||$)', orig_header)
-    if match:
-        return match.group("accession"), match.group("species"), match.group("strain").strip()
-    else:
-        raise ValueError(f"Could not parse accession/species/strain from header: {orig_header}")
-
-def parse_mag_header(orig_header):
-    """
-    Specifically detect MAG format: accession MAG uncultured Genus sp. isolate Strain, ...
-    """
-    match = re.match(r'^(?P<accession>\S+)\s+MAG uncultured (?P<genus>[A-Za-z]+) sp\. isolate (?P<strain>\S+)', orig_header)
-    if match:
-        return match.group("accession"), f"{match.group('genus')} sp.", match.group("strain")
-    return None
-
-def reheader_fasta(original_fasta, bakta_fna, output_fasta):
-    original_records = list(SeqIO.parse(original_fasta, "fasta"))
-    bakta_records = list(SeqIO.parse(bakta_fna, "fasta"))
-
-    if len(original_records) != len(bakta_records):
-        raise ValueError("Number of sequences differs between files!")
-
-    chrom_counter = 1
-    plasmid_counter = 1
-    mag_counter = 1
-    draft_counter = 1
-
-    with open(output_fasta, "w") as out_f:
-        for idx, (orig_rec, bakta_rec) in enumerate(zip(original_records, bakta_records), 1):
-            if str(orig_rec.seq) != str(bakta_rec.seq):
-                raise ValueError(f"Sequence mismatch at sequence {idx}!")
-
-            old_id = parse_old_id(orig_rec.description)
-            key_id = bakta_rec.id  # <-- Use original bakta header here
-
-            # Check chromosome or plasmid first
-            new_header_type = detect_chrom_or_plasmid(orig_rec.description, bakta_rec.description)
-
-            if new_header_type == "chromosome":
-                accession, species, strain = parse_accession_species_strain(orig_rec.description)
-                header = f"{accession}.c{chrom_counter:03d} {species} {strain} |Complete chromosome| |{old_id}| |KEY:{key_id}|"
-                chrom_counter += 1
-
-            elif new_header_type == "plasmid":
-                accession, species, strain = parse_accession_species_strain(orig_rec.description)
-                plasmid_name_match = re.search(r'(plasmid\s+\S+)', orig_rec.description, re.IGNORECASE)
-                plasmid_name = plasmid_name_match.group(1) if plasmid_name_match else f"Plasmid_{plasmid_counter}"
-                header = f"{accession}.p{plasmid_counter:03d} {species} {strain} {plasmid_name} |Complete plasmid| |{old_id}| |KEY:{key_id}|"
-                plasmid_counter += 1
-
-            else:
-                mag_info = parse_mag_header(orig_rec.description)
-                if mag_info:
-                    accession, species, strain = mag_info
-                    header = f"{accession}.m{mag_counter:03d} {species} {strain} |Uncultured MAG| |{old_id}| |KEY:{key_id}|"
-                    mag_counter += 1
-                else:
-                    accession, species, strain = parse_accession_species_strain(orig_rec.description)
-                    header = f"{accession}.d{draft_counter:03d} {species} {strain} |{old_id}| |KEY:{key_id}|"
-                    draft_counter += 1
-
-            bakta_rec.id = header
-            bakta_rec.description = ""
-            SeqIO.write(bakta_rec, out_f, "fasta")
-
-    print(f"✅ New FASTA written to: {output_fasta}")
-
 
 def parse_tsv(tsv_file, debug=False):
     features = {}
@@ -448,11 +420,16 @@ def parse_tsv(tsv_file, debug=False):
             if line.startswith("#") or line.strip() == "":
                 continue
             parts = line.strip().split('\t')
-            if len(parts) < 10:
+            if len(parts) < 9:  # CHANGED to require at least 9 fields
                 continue
+            # Fill missing fields with "-"
+            while len(parts) < 10:
+                parts.append('-')
             seq_id, ftype, start, stop, strand, locus_tag, old_locus_tag, gene, product, dbxrefs = parts[:10]
+            old_locus_tag = old_locus_tag.strip()
             if not file_prefix:
                 file_prefix = ".".join(locus_tag.split(".")[:3])
+
             features[old_locus_tag] = {
                 'SequenceId': seq_id,
                 'Type': ftype,
@@ -465,7 +442,7 @@ def parse_tsv(tsv_file, debug=False):
                 'Product': product,
                 'DbXrefs': dbxrefs,
             }
-            
+
     return features, file_prefix
 
 def generate_new_gene_id(locus_tag, count):
@@ -475,16 +452,28 @@ def generate_new_gene_id(locus_tag, count):
     aabb = parts[0][:4].lower()
     XXX = parts[1]
     YYYY = parts[2]
-    ZZZZZ = f"{count:05d}"
-    return f"{aabb}{XXX}.{YYYY}_{ZZZZZ}"
+    tmp = parts[3][:-1]
+    sp = tmp.split("_")
+    ZZZZZ = int(sp[1])
+    return f"{aabb}{XXX}.{YYYY}.{ZZZZZ}"
 
+   
 def build_fasta_header(feat, count_by_type):
     gene = feat['Gene']
     if not gene:
         count_by_type[feat['Type']] += 1
-        gene = generate_new_gene_id(feat['LocusTag'], count_by_type[feat['Type']])
+        gene = generate_new_gene_id(feat['SequenceId'], count_by_type[feat['Type']])
     return " ".join([
         feat['LocusTag'], feat['Type'], feat['Strand'], feat['Start'], feat['Stop'],
+        gene, feat['OLDLocusTag'], feat['Product'], feat['DbXrefs']
+    ])
+def build_fasta_header4genes(feat, count_by_type):
+    gene = feat['Gene']
+    if not gene:
+        count_by_type[feat['Type']] += 1
+        gene = generate_new_gene_id(feat['SequenceId'], count_by_type[feat['Type']])
+    return " ".join([
+        feat['SequenceId'], feat['Type'], feat['Strand'], feat['Start'], feat['Stop'],
         gene, feat['OLDLocusTag'], feat['Product'], feat['DbXrefs']
     ])
 
@@ -530,7 +519,7 @@ def process_ffn(input_file, features, file_prefix, suffix_map, out_dirs, count_b
                     old_locus = header[1:].split()[0]
                     if old_locus in features:
                         feat = features[old_locus]
-                        fasta_header = build_fasta_header(feat, count_by_type)
+                        fasta_header = build_fasta_header4genes(feat, count_by_type)
                         suffix = suffix_map.get(feat['Type'].lower(), '.misc')
                         out_dir = out_dirs['nuc'] if suffix == '.nuc' else out_dirs['rna']
                         out_file = os.path.join(out_dir, f"{file_prefix}{suffix}")
@@ -546,14 +535,16 @@ def process_ffn(input_file, features, file_prefix, suffix_map, out_dirs, count_b
             old_locus = header[1:].split()[0]
             if old_locus in features:
                 feat = features[old_locus]
-                fasta_header = build_fasta_header(feat, count_by_type)
+                fasta_header = build_fasta_header4genes(feat, count_by_type)
                 suffix = suffix_map.get(feat['Type'].lower(), '.misc')
                 out_dir = out_dirs['nuc'] if suffix == '.nuc' else out_dirs['rna']
                 out_file = os.path.join(out_dir, f"{file_prefix}{suffix}")
                 write_fasta(out_file, fasta_header, "".join(seq_lines))
                 #if debug:
                 #    print(f"[DEBUG] Wrote {old_locus} to {out_file}")
-
+                
+    
+    
 def process_faa(input_file, features, file_prefix, protein_dir, count_by_type, debug=False):
     outfile = os.path.join(protein_dir, f"{file_prefix}.faa")
     open(outfile, 'w').close()
@@ -568,7 +559,7 @@ def process_faa(input_file, features, file_prefix, protein_dir, count_by_type, d
                     old_locus = header[1:].split()[0]
                     if old_locus in features:
                         feat = features[old_locus]
-                        fasta_header = build_fasta_header(feat, count_by_type)
+                        fasta_header = build_fasta_header4genes(feat, count_by_type)
                         write_fasta(outfile, fasta_header, "".join(seq_lines))
                         #if debug:
                         #    print(f"[DEBUG] Wrote {old_locus} to {outfile}")
@@ -581,7 +572,7 @@ def process_faa(input_file, features, file_prefix, protein_dir, count_by_type, d
             old_locus = header[1:].split()[0]
             if old_locus in features:
                 feat = features[old_locus]
-                fasta_header = build_fasta_header(feat, count_by_type)
+                fasta_header = build_fasta_header4genes(feat, count_by_type)
                 write_fasta(outfile, fasta_header, "".join(seq_lines))
                 #if debug:
                 #    print(f"[DEBUG] Wrote {old_locus} to {outfile}")
@@ -1017,3 +1008,47 @@ def build_key_mapping(fasta_file):
         "organism_mapping": organism_mapping,
         "replicon_type_mapping": replicon_type_mapping
     }
+def define_log_file(input_file, output_folder):
+
+    #extracts file_id 
+    filename = os.path.basename(input_file)
+    file_stem = pathlib.Path(filename).stem  # removes .gz or .fna.gz
+    file_id = file_stem.split("_")[0]
+    #creates log folder
+    logs_dir = os.path.join(output_folder, "LOGS")
+    os.makedirs(logs_dir, exist_ok=True)
+    logfile = os.path.join(logs_dir,f"{file_id}.gembases.log")
+    return logfile
+
+
+def check_gembases_output(logfile,identifier):
+    """
+
+    Checks if the pipeline was successful by looking for a specific success message in the log file.
+
+
+
+    Parameters:
+
+        log_file (str): Path to the log file.
+
+        entry_name (str): Name of the entry to search for in the success message.
+
+    
+
+    Returns:
+
+        bool: True if the success message is found, False otherwise.
+    
+    """
+    success_phrase = f"Gembases entry for '{identifier}' performed successfully"
+
+    try:
+        with open(logfile, 'r', encoding='utf-8') as f:
+            for line in f:
+                if success_phrase in line:
+                    return True
+            return False
+    except FileNotFoundError:
+        print(f"❌ Log file not found: {logfile}")
+        return False
