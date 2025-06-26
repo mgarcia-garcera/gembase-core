@@ -35,4 +35,9 @@ I will make evolve this README as I start adding scripts and making them work in
 
 2025.06.18 Transfer all functions to GembaseFunctions.py (GF), and build a script called gembases_builder which calls all the functions at GF and smoothly converts a fasta into a gembases.
 
+    2025.06.24 - Modify function parse_tsv to provide Sequence Id as the input for process_ffn and process_faa
+    2025.06.24 - Modify function process_ffn and process_faa to create those features where no annotation exists (otherwise, they were skipped)
+
+2025.06.25 Create function in GembaseFunctions.py that parses the LOG file in search of the sentence "Gembases entry for '{AABB.XXX.YYYY}' performed successfully" and stops the pipeline if it finds it.
+
 
