@@ -48,7 +48,9 @@ def main():
     
     #create log file if not as argument
     if not args.log:
-        logfile = GF.define_log_file(args.i, args.output) 
+        logfile = GF.define_log_file(args.i, args.output)
+        if not os.path.exists(logfile):
+            open(logfile, 'a').close()
     else:
         logfile = args.log
     
@@ -62,6 +64,7 @@ def main():
     
     if GF.check_gembases_output(logfile, id):
         print("✅ Pipeline already completed Previously!")
+        os.remove(tmpfasta)
         sys.exit()
     else:
         print("❌ Pipeline did not complete successfully or log missing.")

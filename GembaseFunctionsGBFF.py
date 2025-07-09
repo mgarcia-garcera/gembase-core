@@ -2,6 +2,7 @@ import struct
 from Bio.Seq import Seq
 from Bio import Entrez
 from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
 import csv
 import os
 import re
@@ -9,9 +10,46 @@ import subprocess
 import shutil
 import sys
 from collections import defaultdict
+from collections import Counter
 import pathlib
 from pathlib import Path
 import gzip
+
+def extract_definition_keywords(gbff_path):
+    """
+    Extracts unique keywords from DEFINITION lines for each LOCUS in a GBFF.
+
+    Returns:
+        dict: {LOCUS_ID (as in |OLD:XYZ|) → unique keyword string}
+    """
+    open_func = gzip.open if gbff_path.endswith('.gz') else open
+
+    locus_definitions = {}  # LOCUS → DEFINITION
+    token_lists = {}        # LOCUS → set(tokens)
+
+    with open_func(gbff_path, 'rt') as handle:
+        for record in SeqIO.parse(handle, "genbank"):
+            locus_id = record.id.strip()
+            definition = record.description.strip()
+            tokens = set(re.findall(r'\b\w+\b', definition.lower()))  # simple word tokenizer
+
+            locus_definitions[locus_id] = definition
+            token_lists[locus_id] = tokens
+
+    # Compute common keywords across all definitions
+    all_token_sets = list(token_lists.values())
+    if not all_token_sets:
+        return {}
+
+    common_keywords = set.intersection(*all_token_sets)
+
+    # Compute unique term(s) per LOCUS by subtracting common ones
+    locus_unique = {}
+    for locus, tokens in token_lists.items():
+        unique_tokens = sorted(tokens - common_keywords)
+        locus_unique[locus] = " ".join(unique_tokens) if unique_tokens else ""
+
+    return locus_unique
 
 def extract_fna_from_gbff(gbff_path):
     """
@@ -155,6 +193,196 @@ def parse_mag_header(orig_header):
     strain = desc[species_match.end():].strip() or "no_strain"
 
     return accession, species_full, strain
+
+def reheader_fastaGBFF(input_fasta, output_fasta):
+    """
+    Reheaders a single FASTA file based on replicon type and structured identifier format.
+    Input format:
+    >ABUT.001.0002 Genus species strain ContigID,... |OLD:XYZ|
+    
+    Output format:
+    >ABUT.001.0002.d01 Genus species strain ContigID |OLD:XYZ|
+    """
+
+    draft_counter = 1
+    chrom_counter = 1
+    plasmid_counter = 1
+    mag_counter = 1
+
+    with open(input_fasta, 'r') as infile, open(output_fasta, 'w') as outfile:
+        for record in SeqIO.parse(infile, "fasta"):
+            orig_header = record.description
+
+            # Extract old accession
+            old_id = parse_old_id(orig_header)
+
+            # Parse species/strain/etc
+            accession, species, strain = parse_accession_species_strain_draft(orig_header)
+
+            # Remove |OLD:...| and leading accession from description
+            clean_desc = re.sub(r'\|OLD:[^|]+\|?', '', orig_header).strip()
+            clean_desc = clean_desc.replace(',', '')
+
+            # Remove the accession (first token)
+            clean_desc = clean_desc.split(maxsplit=1)
+            clean_desc = clean_desc[1] if len(clean_desc) > 1 else ""
+
+            # Determine genome type suffix
+            genome_type = detect_chrom_or_plasmid(orig_header, orig_header)
+            if genome_type == "chromosome":
+                suffix = f".c{chrom_counter:02d}"
+                chrom_counter += 1
+            elif genome_type == "plasmid":
+                suffix = f".p{plasmid_counter:02d}"
+                plasmid_counter += 1
+            elif parse_mag_header(orig_header):
+                suffix = f".m{mag_counter:02d}"
+                mag_counter += 1
+            else:
+                suffix = f".d{draft_counter:02d}"
+                draft_counter += 1
+
+            # Construct new header
+            new_id = f"{accession}{suffix}"
+            new_header = f">{new_id} {clean_desc.strip()} |OLD:{old_id}|"
+
+            outfile.write(new_header + '\n')
+            seq = str(record.seq)
+            for i in range(0, len(seq), 60):
+                outfile.write(seq[i:i+60] + '\n')
+
+    print(f"✅ Reheadered FASTA written to: {output_fasta}")
+
+def extract_features_from_gbff(gbff_path, identifier, output_tsv, replicon_mapping):
+    """
+    Extracts annotated features from a GBFF or GBFF.GZ file and writes them to a TSV.
+
+    Columns:
+    - LocusTag (standardized, full format)
+    - Type (e.g., CDS, rRNA)
+    - Start
+    - Stop
+    - Strand (D or C)
+    - Replicon (e.g., ABUT.001.0002.d01)
+    - OLDLocusTag (from original annotation)
+    - Product (description)
+    """
+
+    is_gzipped = gbff_path.endswith(".gz")
+    open_func = gzip.open if is_gzipped else open
+
+    feature_counters = {}  # ✅ Per-replicon counters
+    rows = []
+
+    with open_func(gbff_path, "rt") as handle:
+        for record in SeqIO.parse(handle, "genbank"):
+            old_locus_id = record.id.split('.')[0]  # e.g., NZ_NIGF01000001
+            if old_locus_id not in replicon_mapping:
+                raise ValueError(f"❌ Replicon ID '{old_locus_id}' not found in mapping!")
+
+            replicon = replicon_mapping[old_locus_id]  # ✅ e.g., ABUT.001.0002.d01
+
+            # ✅ Extract suffix (e.g., .d01)
+            suffix_match = re.search(r'\.([cpdm]\d{2,3})$', replicon)
+            if not suffix_match:
+                raise ValueError(f"❌ Cannot extract [cpdm]ZZ from replicon name: {replicon}")
+            suffix = suffix_match.group(1)
+
+            # ✅ Initialize per-replicon feature count
+            if suffix not in feature_counters:
+                feature_counters[suffix] = 1
+
+            for feature in record.features:
+                if feature.type.lower() not in ['cds', 'rrna', 'trna']:
+                    continue
+
+                # Coordinates
+                start = int(feature.location.start) + 1
+                end = int(feature.location.end)
+                strand = feature.location.strand
+                strand_symbol = 'D' if strand == 1 else 'C'
+
+                # Original locus tag
+                old_tag = feature.qualifiers.get('locus_tag', ["-"])[0]
+
+                # Product
+                product = feature.qualifiers.get('product', ["-"])[0]
+
+                # ✅ Generate locus tag using new format
+                feature_number = f"{feature_counters[suffix]:06}"
+                new_tag = f"{identifier}.{suffix}_{feature_number}"
+
+                # ✅ Increment counter
+                feature_counters[suffix] += 1
+
+                # Type
+                ftype = feature.type
+
+                rows.append([
+                    new_tag, ftype, start, end, strand_symbol, replicon, old_tag, product
+                ])
+
+    # Write TSV
+    with open(output_tsv, "w", newline='') as out:
+        writer = csv.writer(out, delimiter='\t')
+        writer.writerow([
+            "#LocusTag", "Type", "Start", "Stop", "Strand",
+            "Replicon", "OLDLocusTag", "Product"
+        ])
+        writer.writerows(rows)
+
+    print(f"✅ Extracted {sum(feature_counters.values())} features to: {output_tsv}")
+   
+def build_old_to_new_replicon_mapping(fasta_file):
+    """
+    Builds a dictionary mapping from OLD accession ID to new replicon ID from a FASTA file.
+
+    Args:
+        fasta_file (str): Path to the FASTA file with headers like:
+                          >ABUT.001.0002.d01 ... |OLD:NZ_ABC123456|
+
+    Returns:
+        dict: { OLD_ID → NEW_ID }
+    """
+    mapping = {}
+
+    for record in SeqIO.parse(fasta_file, "fasta"):
+        header = record.description
+
+        # Extract OLD ID
+        old_match = re.search(r'\|OLD:([^|]+)\|?', header)
+        if not old_match:
+            raise ValueError(f"Missing |OLD:...| in header: {header}")
+        old_id = old_match.group(1)
+
+        # Extract new ID (first word in header)
+        new_id = header.split()[0]
+
+        mapping[old_id] = new_id
+
+    print(f"✅ Built mapping for {len(mapping)} replicons.")
+    return mapping
+
+def build_old_to_new_replicon_mapping_new(fasta_file):
+    """
+    Builds a dictionary mapping from OLD accession ID to new replicon ID from a FASTA file.
+
+    Returns:
+        dict: { OLD_ID → NEW_ID }
+    """
+    mapping = {}
+
+    for record in SeqIO.parse(fasta_file, "fasta"):
+        header = record.description
+        match = re.search(r'\|OLD:([^\|]+)\|?', header)
+        if not match:
+            raise ValueError(f"❌ Missing |OLD:...| in header: {header}")
+        old_id = match.group(1).strip()  # ← Keep the .1 suffix if present
+        new_id = header.split()[0]
+        mapping[old_id] = new_id
+
+    print(f"✅ Built mapping for {len(mapping)} replicons.")
+    return mapping
 
 def reheader_fasta(original_fasta, bakta_fna, output_fasta):
     original_records = list(SeqIO.parse(original_fasta, "fasta"))
@@ -312,10 +540,181 @@ def detect_file_format(file_path):
         print(f"Error reading file: {e}")
         return 'Unknown'
 
+class GBFFSpeciesIdentifier:
+    ignored_words = ['Candidatus', 'MAG', 'Uncultured', 'uncultured', 'environmental', 'bacterium']
+    pattern = r'((?:' + '|'.join(map(re.escape, ignored_words)) + r')\s+)*([A-Z][a-z]+)\s+([a-z]+)'
+
+    species_regex = re.compile(pattern, re.IGNORECASE)
+
+    def __init__(self, reference_file, history_file):
+        self.reference_file = reference_file
+        self.history_file = history_file
+        self.reference = self._load_reference()
+        self.history = self._load_history()
+
+    def _load_reference(self):
+        ref = {}
+        if os.path.isfile(self.reference_file):
+            with open(self.reference_file, newline='') as csvfile:
+                reader = csv.reader(csvfile, delimiter='\t')
+                for row in reader:
+                    if len(row) >= 2:
+                        ref[row[1]] = row[0]
+        return ref
+
+    def _load_history(self):
+        hist = {}
+        if os.path.isfile(self.history_file):
+            with open(self.history_file, newline='') as csvfile:
+                reader = csv.reader(csvfile, delimiter='\t')
+                for row in reader:
+                    if len(row) >= 2:
+                        hist[row[1]] = row[0]
+        return hist
+
+    def _get_aabb(self, genus, species):
+        return (genus[:2] + species[:2]).upper()
+
+    def _next_species_code(self, aabb):
+        existing = [v for v in self.reference.values() if v.startswith(aabb)]
+        nums = [int(v.split('.')[1]) for v in existing if '.' in v]
+        next_number = max(nums) + 1 if nums else 1
+        return f"{aabb}.{next_number:03d}"
+
+    def _next_strain_code(self, aabb_xxx):
+        existing = [v for v in self.history.values() if v.startswith(aabb_xxx + ".")]
+        nums = [int(v.split('.')[-1]) for v in existing]
+        next_number = max(nums) + 1 if nums else 1
+        return f"{next_number:04d}"
+
+    def _extract_info_from_definition(self, record):
+        definition = record.description
+        print(definition)
+
+        # Step 1: Match genus and species
+        match = self.species_regex.search(definition)
+        if not match:
+            raise ValueError(f"Could not parse genus and species from: {definition}")
+        genus = match.group(2)
+        species = match.group(3)
+
+        # Step 2: Extract everything after the species
+        remainder = definition[match.end():].strip()
+
+        # Step 3: Look for "isolate XYZ" or "strain XYZ"
+        strainIDtmp = None
+        isolate_match = re.search(r'isolate[_\-\s]+([\w\-\.]+)', remainder)
+        strain_match = re.search(r'strain[_\-\s]+([\w\-\.]+(?:[\s_]+[\w\-\.]+)?)', remainder)
+
+        if isolate_match:
+            strainIDtmp = isolate_match.group(1)
+        elif strain_match:
+            strainIDtmp = strain_match.group(1)
+        else:
+            # fallback: use first word in remainder if any
+            strainIDtmp = remainder.split()[0] if remainder else "no_strain"
+
+        # Step 4: Trim bin suffixes like -bin1, _bin.2, .bin3
+        strainIDtmp = re.split(r'[-_.]bin[\._]?\d+', strainIDtmp)[0].strip()
+
+        return genus, species, strainIDtmp
+
+    def assign_identifier_from_gbff(self, gbff_path):
+        open_func = gzip.open if gbff_path.endswith('.gz') else open
+        with open_func(gbff_path, 'rt') as handle:
+            record = next(SeqIO.parse(handle, 'genbank'))
+
+        genus, species, strain = self._extract_info_from_definition(record)
+        species_key = f"{genus} {species}"
+        strain_key = f"{species_key} {strain}"
+
+        # Species-level code
+        if species_key not in self.reference:
+            aabb = self._get_aabb(genus, species)
+            aabb_xxx = self._next_species_code(aabb)
+            self.reference[species_key] = aabb_xxx
+            with open(self.reference_file, 'a', newline='') as csvfile:
+                csv.writer(csvfile, delimiter='\t').writerow([aabb_xxx, species_key])
+        else:
+            aabb_xxx = self.reference[species_key]
+
+        # Strain-level code
+        if strain_key not in self.history:
+            yyyy = self._next_strain_code(aabb_xxx)
+            identifier = f"{aabb_xxx}.{yyyy}"
+            self.history[strain_key] = identifier
+            with open(self.history_file, 'a', newline='') as csvfile:
+                csv.writer(csvfile, delimiter='\t').writerow([identifier, strain_key])
+        else:
+            identifier = self.history[strain_key]
+
+        print(f"[INFO] Identifier assigned: {identifier} ({strain_key})")
+        return identifier
+
 class SpeciesIdentifier:
     ignored_words = ['Candidatus', 'MAG', 'Uncultured', 'uncultured', 'environmental', 'bacterium']
     pattern = r'((?:' + '|'.join(map(re.escape, ignored_words)) + r')\s+)*([A-Z][a-z]+)\s+(sp\.|[a-z]+)'
     species_regex = re.compile(pattern, re.IGNORECASE)
+
+    def get_identifier_from_file(self, file_path):
+        """
+        Retrieves only the identifier (AABB.XXX.YYYY) from a FASTA or GBFF file,
+        without writing any output files.
+        """
+        def detect_format(path):
+            with (gzip.open(path, 'rt') if path.endswith('.gz') else open(path, 'r')) as f:
+                for line in f:
+                    if line.startswith('>'):
+                        return 'fasta'
+                    elif line.startswith('LOCUS'):
+                        return 'gbff'
+            raise ValueError("Unknown file format: not FASTA or GBFF.")
+
+        file_format = detect_format(file_path)
+
+        # Extract species info
+        if file_format == 'fasta':
+            with (gzip.open(file_path, 'rt') if file_path.endswith('.gz') else open(file_path, 'r')) as f:
+                for line in f:
+                    if line.startswith('>'):
+                        genus, species, strain = self._extract_species_info(line)
+                        break
+                else:
+                    raise ValueError("No FASTA header found.")
+        elif file_format == 'gbff':
+            with (gzip.open(file_path, 'rt') if file_path.endswith('.gz') else open(file_path, 'r')) as f:
+                record = next(SeqIO.parse(f, 'genbank'))
+                organism = record.annotations.get("organism", "")
+                strain = ""
+                for feature in record.features:
+                    if feature.type == "source":
+                        strain = feature.qualifiers.get("strain", [""])[0]
+                        break
+                genus, species = organism.split()[:2]
+
+        species_key = f"{genus} {species}"
+        strain_key = f"{species_key} {strain}"
+
+        if strain_key in self.history:
+            return self.history[strain_key]
+        else:
+            aabb = self._get_aabb(genus, species)
+            aabb_xxx = self.reference.get(species_key)
+            if not aabb_xxx:
+                aabb_xxx = self._next_species_code(aabb)
+                self.reference[species_key] = aabb_xxx
+                with open(self.reference_file, 'a', newline='') as csvfile:
+                    writer = csv.writer(csvfile, delimiter='\t')
+                    writer.writerow([aabb_xxx, species_key])
+
+            yyyy = self._next_strain_code(aabb_xxx)
+            identifier = f"{aabb_xxx}.{yyyy}"
+            self.history[strain_key] = identifier
+            with open(self.history_file, 'a', newline='') as csvfile:
+                writer = csv.writer(csvfile, delimiter='\t')
+                writer.writerow([identifier, strain_key])
+
+            return identifier
 
     def __init__(self, reference_file, history_file, output_dir):
         self.reference_file = reference_file
@@ -560,6 +959,7 @@ class SpeciesIdentifier:
         print(f"[INFO] Created: {output_fasta}")
         print(f"[INFO] Identifier for assembly: {identifier} ({strain_key})")
         return identifier, output_fasta
+    
 def run_bakta(fasta_file, output_dir, prefix, threads=4, db_path=None, force=False):
     """
     Run Bakta on the provided FASTA file.
@@ -737,8 +1137,6 @@ def process_ffn(input_file, features, file_prefix, suffix_map, out_dirs, count_b
                 #if debug:
                 #    print(f"[DEBUG] Wrote {old_locus} to {out_file}")
                 
-    
-    
 def process_faa(input_file, features, file_prefix, protein_dir, count_by_type, debug=False):
     outfile = os.path.join(protein_dir, f"{file_prefix}.faa")
     open(outfile, 'w').close()
@@ -1235,47 +1633,428 @@ def check_gembases_output(logfile,identifier):
         bool: True if the success message is found, False otherwise.
     
     """
-    success_phrase = f"Gembases entry for '{identifier}' performed successfully"
-
+    success_phrase1 = f"Gembases entry for '{identifier}' performed successfully"
+    success_phrase2 = 'The pipeline was successful'
     try:
         with open(logfile, 'r', encoding='utf-8') as f:
             for line in f:
-                if success_phrase in line:
+                if success_phrase1 in line:
+                    return True
+                elif success_phrase2 in line:
                     return True
             return False
     except FileNotFoundError:
         print(f"❌ Log file not found: {logfile}")
         return False
-
-def extract_fna_from_gbff(gbff_path):
-    """
-    Extracts genomic sequences from a GBFF or GBFF.GZ file and writes them to a temporary FASTA (fna) file.
     
+def check_gembases_output_noid(logfile):
+    """
+
+    Checks if the pipeline was successful by looking for a specific success message in the log file.
+
+
+
     Parameters:
-        gbff_path (str): Path to the GBFF file (can be .gbff or .gbff.gz).
+
+        log_file (str): Path to the log file.
+
+        entry_name (str): Name of the entry to search for in the success message.
+
     
+
     Returns:
-        str: Path to the temporary fna (FASTA) file.
+
+        bool: True if the success message is found, False otherwise.
+    
     """
+    success_phrase1 = "Pipeline already completed Previously!"
+    success_phrase2 = 'The pipeline was successful'
     try:
-        # Open depending on whether file is gzipped
-        if gbff_path.endswith('.gz'):
-            open_func = gzip.open
-            mode = 'rt'  # read text mode
+        with open(logfile, 'r', encoding='utf-8') as f:
+            for line in f:
+                if success_phrase1 in line:
+                    return True
+                elif success_phrase2 in line:
+                    return True
+            return False
+    except FileNotFoundError:
+        print(f"❌ Log file not found: {logfile}")
+        return False    
+def export_renamed_fasta_from_gbff(gbff_path, identifier, output_fasta):
+    """
+    Creates a renamed FASTA file from a GBFF(.gz) file using original DEFINITION lines.
+    Header format:
+    >identifier.suffix original_DEFINITION |KEY:unique_word| |OLD:locus_id|
+    """
+
+    # 1. Parse DEFINITIONs
+    def parse_definitions(gbff_path):
+        open_func = gzip.open if gbff_path.endswith('.gz') else open
+        definitions = {}
+        with open_func(gbff_path, 'rt') as handle:
+            for record in SeqIO.parse(handle, "genbank"):
+                definitions[record.id] = record.description
+        return definitions
+
+    # 2. Extract KEY from DEFINITION
+    def extract_key_from_definition(defn):
+        match = re.search(r'(contig\d+|scaffold\d+|chromosome|plasmid\s+\S+)', defn, re.IGNORECASE)
+        return match.group(1) if match else "Unknown"
+
+    # Gather definitions
+    definitions = parse_definitions(gbff_path)
+
+    suffix_counters = {'c': 1, 'p': 1, 'm': 1, 'd': 1}
+    open_func = gzip.open if gbff_path.endswith(".gz") else open
+
+    with open_func(gbff_path, "rt") as handle, open(output_fasta, "w") as out_f:
+        for record in SeqIO.parse(handle, "genbank"):
+            locus_id = record.id
+            defn = definitions.get(locus_id, "")
+            key = extract_key_from_definition(defn)
+            old_id = locus_id.replace(".1", "")  # Clean trailing version if present
+
+            genome_type = detect_chrom_or_plasmid(defn, defn)
+            if genome_type == "chromosome":
+                suffix_type = "c"
+            elif genome_type == "plasmid":
+                suffix_type = "p"
+            elif parse_mag_header(defn):
+                suffix_type = "m"
+            else:
+                suffix_type = "d"
+
+            index = suffix_counters[suffix_type]
+            suffix = f".{suffix_type}{index:02d}"
+            suffix_counters[suffix_type] += 1
+
+            new_id = f"{identifier}{suffix}"
+            clean_defn = defn.rstrip(".")
+
+            header = f">{new_id} {clean_defn} |KEY:{key}| |OLD:{old_id}|"
+            out_f.write(header + "\n")
+
+            seq = str(record.seq)
+            for i in range(0, len(seq), 60):
+                out_f.write(seq[i:i+60] + "\n")
+
+    print(f"✅ Renamed FASTA written to: {output_fasta}")
+
+def rename_features_in_gbff(gbff_input, gbff_output, tsv_mapping_file, renamed_fasta):
+    """
+    Renames:
+    - LOCUS name (record.name) from FASTA
+    - locus_tag values from TSV
+
+    Leaves:
+    - ACCESSION
+    - VERSION
+
+    untouched.
+    """
+
+    # Step 1: Build OLD → NEW LOCUS name mapping from FASTA
+    replicon_mapping = {}
+    for record in SeqIO.parse(renamed_fasta, "fasta"):
+        header = record.description
+        match = re.search(r'\|OLD:([^\|\s]+)', header)
+        if not match:
+            raise ValueError(f"❌ Missing |OLD:...| in FASTA header: {header}")
+        old_id = match.group(1).split('.')[0]       # e.g., NZ_NIGF01000001
+        new_locus = header.split()[0]               # e.g., ABUT.001.0002.d01
+        replicon_mapping[old_id] = new_locus
+
+    print(f"✅ Loaded {len(replicon_mapping)} replicon mappings from FASTA")
+
+    # Step 2: Load OLD → NEW locus_tag mapping from TSV
+    old_to_new_tag = {}
+    with open(tsv_mapping_file, 'r') as tsv:
+        reader = csv.DictReader(tsv, delimiter='\t')
+        for row in reader:
+            old = row['OLDLocusTag'].strip()
+            new = row['#LocusTag'].strip()
+            if old != "-":
+                old_to_new_tag[old] = new
+
+    print(f"✅ Loaded {len(old_to_new_tag)} feature tag mappings from TSV")
+
+    # Step 3: Update GBFF
+    open_func = gzip.open if gbff_input.endswith(".gz") else open
+    with open_func(gbff_input, "rt") as in_handle, open(gbff_output, "w") as out_handle:
+        updated_records = []
+
+        for record in SeqIO.parse(in_handle, "genbank"):
+            original_accession = record.annotations.get('accessions', [record.id])[0]
+            base_id = original_accession.split('.')[0]
+
+            if base_id not in replicon_mapping:
+                raise ValueError(f"❌ No renamed LOCUS for: {base_id}")
+
+            new_locus = replicon_mapping[base_id]
+
+            # ✅ Set new LOCUS (name only), but preserve ACCESSION/VERSION
+            record.name = new_locus                         # LOCUS line
+            record.id = original_accession                  # ACCESSION/VERSION tracking
+            if "." in original_accession:
+                record.annotations["sequence_version"] = int(original_accession.split(".")[1])  # ✅ restore VERSION
+            else:
+                record.annotations["sequence_version"] = 1
+            # description: reattach using new LOCUS name
+            if record.description.startswith(record.id):
+                record.description = record.description.replace(record.id, new_locus, 1)
+            else:
+                record.description = f"{new_locus} {record.description}"
+
+            # ❌ Do NOT change record.annotations['accessions'] or sequence_version
+
+            # ✅ Rename features
+            for feature in record.features:
+                if 'locus_tag' in feature.qualifiers:
+                    old_tag = feature.qualifiers['locus_tag'][0]
+                    if old_tag in old_to_new_tag:
+                        new_tag = old_to_new_tag[old_tag]
+                        feature.qualifiers['locus_tag'][0] = new_tag
+
+                    # ✅ Rename /protein_id and preserve old as /old_protein_id
+                    if 'protein_id' in feature.qualifiers:
+                        old_prot_id = feature.qualifiers['protein_id'][0]
+                        feature.qualifiers['old_protein_id'] = [old_prot_id]
+                        feature.qualifiers['protein_id'][0] = new_tag
+
+            updated_records.append(record)
+
+        SeqIO.write(updated_records, out_handle, "genbank")
+
+    print(f"✅ GBFF written: LOCUS updated, ACCESSION/VERSION preserved → {gbff_output}")
+
+def extract_feature_fastas(gbff_path, identifier, output_dir="."):
+    """
+    Extracts CDS, tRNA, rRNA, and ncRNA features into categorized FASTA files:
+    - Genes/{identifier}.nuc
+    - Proteins/{identifier}.prt
+    - RNA/{identifier}.trna
+    - RNA/{identifier}.rrna
+    - RNA/{identifier}.ncrna
+
+    Uses feature coordinates for RNA and nucleotide CDS extraction.
+    """
+
+    open_func = gzip.open if gbff_path.endswith(".gz") else open
+
+    cds_nuc = []
+    cds_prot = []
+    trna_seqs = []
+    rrna_seqs = []
+    ncrna_seqs = []
+
+    # Read GBFF and extract features
+    with open_func(gbff_path, "rt") as handle:
+        for record in SeqIO.parse(handle, "genbank"):
+            seq = record.seq
+            for feature in record.features:
+                if not feature.location:
+                    continue
+
+                ftype = feature.type.lower()
+                locus_tag = feature.qualifiers.get("locus_tag", ["unnamed_feature"])[0]
+
+                # CDS: nucleotide + translation (if available)
+                if ftype == "cds":
+                    nuc_seq = feature.extract(seq)
+                    product = feature.qualifiers.get("product", ["-"])[0]
+                    header = make_header(locus_tag, "CDS", feature.location, product)
+                    cds_nuc.append(SeqRecord(nuc_seq, id=locus_tag, description=header))
+
+                    if "translation" in feature.qualifiers:
+                        prot_seq = Seq(feature.qualifiers["translation"][0])
+                        cds_prot.append(SeqRecord(prot_seq, id=locus_tag, description=header))
+
+                # tRNA
+                elif ftype == "trna":
+                    product = feature.qualifiers.get("product", ["-"])[0]
+                    header = make_header(locus_tag, "tRNA", feature.location, product)
+                    trna_seqs.append(SeqRecord(feature.extract(seq), id=locus_tag, description=header))
+
+                # rRNA
+                elif ftype == "rrna":
+                    product = feature.qualifiers.get("product", ["-"])[0]
+                    header = make_header(locus_tag, "rRNA", feature.location, product)
+                    rrna_seqs.append(SeqRecord(feature.extract(seq), id=locus_tag, description=header))
+
+                # ncRNA
+                elif ftype == "ncrna":
+                    product = feature.qualifiers.get("product", ["-"])[0]
+                    header = make_header(locus_tag, "ncRNA", feature.location, product)
+                    ncrna_seqs.append(SeqRecord(feature.extract(seq), id=locus_tag, description=header))
+
+    # Create output folders
+    os.makedirs(os.path.join(output_dir, "Genes"), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "Proteins"), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "RNA"), exist_ok=True)
+
+    # Save to FASTA
+    def write_records(records, path):
+        if records:
+            with open(path, "w") as f:
+                SeqIO.write(records, f, "fasta")
+            print(f"✅ Wrote {len(records)} → {path}")
+
+    write_records(cds_nuc, os.path.join(output_dir, "Genes", f"{identifier}.nuc"))
+    write_records(cds_prot, os.path.join(output_dir, "Proteins", f"{identifier}.prt"))
+    write_records(trna_seqs, os.path.join(output_dir, "RNA", f"{identifier}.trna"))
+    write_records(rrna_seqs, os.path.join(output_dir, "RNA", f"{identifier}.rrna"))
+    write_records(ncrna_seqs, os.path.join(output_dir, "RNA", f"{identifier}.ncrna"))
+
+def common_starting_substring(strings):
+    if not strings:
+        return ""
+    shortest = min(strings, key=len)
+    for i in range(len(shortest)):
+        char = shortest[i]
+        for other in strings:
+            if other[i] != char:
+                return shortest[:i]
+    return shortest
+
+def common_starting_words(strings):
+    if not strings:
+        return ""
+    # Split all strings into lists of words
+    split_strings = [s.split() for s in strings]
+    # Find the shortest list of words
+    shortest = min(split_strings, key=len)
+    
+    common_words = []
+    for i in range(len(shortest)):
+        word = shortest[i]
+        # Check if this word is present at position i in all strings
+        if all(words[i] == word for words in split_strings):
+            common_words.append(word)
         else:
-            open_func = open
-            mode = 'r'
+            break
+    
+    # Join the common words back into a string
+    return " ".join(common_words)
 
-        temp_fna = tempfile.NamedTemporaryFile(delete=False, suffix=".fna", mode='w')
+def extract_common_description_prefix_auto(gbff_path):
+    descriptions = []
+    _, ext = os.path.splitext(gbff_path)
+    if ext == '.gz':
+        with gzip.open(gbff_path, 'rt') as handle:
+            for record in SeqIO.parse(handle, "genbank"):
+                descriptions.append(record.description)
+    else:
+        with open(gbff_path, 'rt') as handle:
+            for record in SeqIO.parse(handle, "genbank"):
+                descriptions.append(record.description)
+    
+    return common_starting_words(descriptions)
 
-        with open_func(gbff_path, mode) as gbff_handle:
-            records = SeqIO.parse(gbff_handle, "genbank")
-            count = SeqIO.write(records, temp_fna, "fasta")
-        
-        temp_fna.close()
-        print(f"Extracted {count} sequences to: {temp_fna.name}")
-        return temp_fna.name
+def summarize_gbff_assembly(gbff_path):
+    """
+    Parses a GBFF file to extract genome statistics and annotation summary.
+    Returns a dictionary with keys:
+    - taxID, taxLine, Length, GC, N50, N90, N ratio, coding density, etc.
+    """
 
-    except Exception as e:
-        print(f"Error extracting FNA from GBFF: {e}")
-        return None
+    open_func = gzip.open if gbff_path.endswith(".gz") else open
+
+    taxid = None
+    taxline = None
+    total_length = 0
+    gc_count = 0
+    n_count = 0
+    contig_lengths = []
+    feature_counts = Counter()
+    cds_bp_total = 0
+    hypothetical_count = 0
+
+    with open_func(gbff_path, "rt") as handle:
+        for record in SeqIO.parse(handle, "genbank"):
+            seq = record.seq
+            contig_len = len(seq)
+            total_length += contig_len
+            gc_count += seq.count("G") + seq.count("C") + seq.count("g") + seq.count("c")
+            n_count += seq.upper().count("N")
+            contig_lengths.append(contig_len)
+
+            # Taxonomy parsing
+            if not taxid:
+                for feature in record.features:
+                    if feature.type == "source":
+                        dbxrefs = feature.qualifiers.get("db_xref", [])
+                        for ref in dbxrefs:
+                            if ref.startswith("taxon:"):
+                                taxid = ref.split(":")[1]
+                        taxline = feature.qualifiers.get("organism", [""])[0]
+                        break
+
+            # Feature parsing
+            for feature in record.features:
+                ftype = feature.type.lower()
+                feature_counts[ftype] += 1
+
+                if ftype == "cds":
+                    start = int(feature.location.start)
+                    end = int(feature.location.end)
+                    cds_bp_total += abs(end - start)
+
+                    # Hypotheticals
+                    prod = feature.qualifiers.get("product", [""])[0].lower()
+                    if "hypothetical protein" in prod:
+                        hypothetical_count += 1
+
+    # Assembly stats
+    contig_lengths.sort(reverse=True)
+    n50 = compute_nX(contig_lengths, 50)
+    n90 = compute_nX(contig_lengths, 90)
+    gc_pct = round((gc_count / total_length) * 100, 1) if total_length else 0
+    n_pct = round((n_count / total_length) * 100, 1) if total_length else 0
+    coding_density = round((cds_bp_total / total_length) * 100, 1) if total_length else 0
+
+    return {
+        "taxID": taxid or "unknown",
+        "species": taxline or "unknown",
+        "taxline": "unknown",
+        "Length": total_length,
+        "repliconsCount": len(contig_lengths),
+        "GC": gc_pct,
+        "N50": n50,
+        "N90": n90,
+        "N ratio": n_pct,
+        "coding density": coding_density,
+        "tRNAs": feature_counts.get("trna", 0),
+        "tmRNAs": feature_counts.get("tmrna", 0),
+        "rRNAs": feature_counts.get("rrna", 0),
+        "ncRNAs": feature_counts.get("ncrna", 0),
+        "ncRNA regions": feature_counts.get("ncrna_region", 0),
+        "CRISPR arrays": feature_counts.get("crispr", 0),
+        "CDSs": feature_counts.get("cds", 0),
+        "pseudogenes": feature_counts.get("pseudogene", 0),
+        "hypotheticals": hypothetical_count,
+        "sORFs": feature_counts.get("sorf", 0),
+        "gaps": feature_counts.get("gap", 0),
+        "oriCs": feature_counts.get("origin_of_replication", 0),
+        "oriVs": feature_counts.get("oriv", 0),
+        "oriTs": feature_counts.get("orit", 0)
+    }
+
+
+def compute_nX(lengths, X):
+    """
+    Compute N50, N90, etc.
+    """
+    threshold = sum(lengths) * (X / 100)
+    cumulative = 0
+    for l in lengths:
+        cumulative += l
+        if cumulative >= threshold:
+            return l
+    return 0
+
+def make_header(locus_tag, ftype, loc, product, old_tag=None):
+    strand = "D" if loc.strand == 1 else "C"
+    start = int(loc.start) + 1
+    end = int(loc.end)
+    old_part = f" |OLD:{old_tag}|" if old_tag else ""
+    return f"{locus_tag} {ftype} {start} {end} {strand} {product}{old_part}"
