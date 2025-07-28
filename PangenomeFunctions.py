@@ -6,6 +6,9 @@ from Bio import SeqIO
 import time
 from functools import wraps
 import shutil
+import sys
+from collections import defaultdict
+import gzip
 def timed(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -60,7 +63,7 @@ def run_cmd(cmd, log_path):
             stderr=log_file,
             check=True
         )
-def rename_fasta_headers(input_fasta, output_fasta, species_id):
+def rename_fasta_headers(input_fasta, output_fasta, species_id, taxids):
     """
     Renames FASTA headers to:
         >{species_id}_FAMXXXXXX0 | description | strain_id
@@ -89,10 +92,14 @@ def rename_fasta_headers(input_fasta, output_fasta, species_id):
         description = " ".join(desc_fields[5:]) if len(desc_fields) > 5 else ""
 
         # Step 4: Build new ID and description
-        fam_id = f"{species_id}_FAM{counter:06d}0"
+        fam_id = f"{species_id}_FAM{counter:07d}0"
         record.id = fam_id
-        record.description = f"{fam_id} | {description} | {strain_id}"
-
+        if taxids:
+            tax_id = taxids[species_id]
+            record.description = f"{fam_id} | taxID:{tax_id} | {description} | {strain_id}"
+        else:
+            record.description = f"{fam_id} | {description} | {strain_id}"
+                
         renamed_records.append(record)
         counter += 1
 
@@ -325,3 +332,138 @@ def rename_sequences_with_fam(rep_fasta, fam_file, identifier, output_file):
             SeqIO.write(record, out_fh, "fasta")
 
     print(f"✅ Sequences renamed and saved to {output_file}")
+
+
+class UnionFind:
+    def __init__(self):
+        self.parent = {}
+    
+    def find(self, item):
+        if item not in self.parent:
+            self.parent[item] = item
+        if self.parent[item] !=item:
+            self.parent[item] = self.find(self.parent[item])
+        return self.parent[item]
+    
+    def union(self, a, b):
+        root_a = self.find(a)
+        root_b = self.find(b)
+        if root_a != root_b:
+            self.parent[root_b] = root_a
+
+
+def process_and_cluster(input_path, output_path,
+                        identity_threshold=95.0,
+                        coverage1_threshold=70.0,
+                        coverage2_threshold=70.0):
+    uf = UnionFind()
+    edges = defaultdict(list)
+
+    print("First pass: Reading and building clusters...")
+
+    with open(input_path, 'r') as infile:
+        for line_num, line in enumerate(infile, 1):
+            try:
+                fields = line.rstrip('\n').split('\t')
+                if len(fields) < 7:
+                    continue
+
+                identity = float(fields[2])
+                coverage1 = float(fields[3])
+                coverage2 = float(fields[4])
+
+                if (identity < identity_threshold or
+                    coverage1 < coverage1_threshold or
+                    coverage2 < coverage2_threshold):
+                    continue  # skip low-quality comparisons
+
+                acc1 = fields[5].split()[0]
+                acc2 = fields[6].split()[0]
+
+                # Build connections
+                uf.union(acc1, acc2)
+                edges[acc1].append((acc2, identity))
+                edges[acc2].append((acc1, identity))
+
+                if line_num % 1_000_000 == 0:
+                    print(f"Processed {line_num} lines...")
+
+            except Exception as e:
+                print(f"Error at line {line_num}: {e}", file=sys.stderr)
+                continue
+
+    print("Second pass: Assembling clusters...")
+
+    clusters = defaultdict(set)
+    for accession in uf.parent:
+        root = uf.find(accession)
+        clusters[root].add(accession)
+
+    print(f"Found {len(clusters)} clusters.")
+
+    with open(output_path, 'w') as outfile:
+        for idx, (cluster_root, members) in enumerate(clusters.items(), 1):
+            clstr_id = f"CLSTR_{idx:04d}"
+            entries = []
+            seen = set()
+
+            for acc in members:
+                for neighbor, ident in edges[acc]:
+                    if neighbor in members and (acc, neighbor) not in seen and (neighbor, acc) not in seen:
+                        entries.append(f"{acc}:{ident:.2f}")
+                        entries.append(f"{neighbor}:{ident:.2f}")
+                        seen.add((acc, neighbor))
+
+            # Remove duplicates and preserve order
+            unique_entries = list(dict.fromkeys(entries))
+            outfile.write(f"{clstr_id}\t" + "\t".join(unique_entries) + "\n")
+
+
+def extract_accessions_from_gbff(gbff_path, output_path=None):
+    accessions = []
+
+    with gzip.open(gbff_path, "rt") as handle:
+        for record in SeqIO.parse(handle, "genbank"):
+            acc = record.id.split('.')[0]  # Remove version if needed
+            accessions.append(acc)
+
+    return accessions
+
+def extract_centroid_sequences(clustering_file, fasta_file, output_fasta):
+    """
+    Extracts sequences from a FASTA file whose headers match the centroids
+    (unique values from column 1) in the clustering file.
+    
+    Parameters:
+        clustering_file (str): Path to the clustering file.
+        fasta_file (str): Path to the input FASTA file.
+        output_fasta (str): Path to the output FASTA file containing centroid sequences.
+    """
+    # Extract unique centroids from column 1
+    centroids = set()
+    with open(clustering_file, "r") as f:
+        for line in f:
+            if line.strip():
+                centroid = line.strip().split()[0]
+                centroids.add(centroid)
+
+    # Parse FASTA and extract matching records
+    records = SeqIO.parse(fasta_file, "fasta")
+    matching_records = (record for record in records if record.id in centroids)
+
+    # Write the results
+    count = SeqIO.write(matching_records, output_fasta, "fasta")
+    print(f"Extracted {count} centroid sequences to '{output_fasta}'")
+
+def parse_taxid_mapping(mapping_file):
+    taxid_map = {}
+    with open(mapping_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 2:
+                species_id = parts[0]
+                taxids = parts[1].split()
+                taxid_map[species_id] = taxids[0]  # Use only the first taxid
+    return taxid_map
+
+

@@ -1,4 +1,5 @@
 import struct
+import Bio
 from Bio.Seq import Seq
 from Bio import Entrez
 from Bio import SeqIO

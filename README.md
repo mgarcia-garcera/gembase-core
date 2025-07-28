@@ -40,4 +40,49 @@ I will make evolve this README as I start adding scripts and making them work in
 
 2025.06.25 Create function in GembaseFunctions.py that parses the LOG file in search of the sentence "Gembases entry for '{AABB.XXX.YYYY}' performed successfully" and stops the pipeline if it finds it.
 
+2025.07.03 Built script that constructs the pangenome for any species identifier "AABB.XXX"
+	2025.07.06 - The script works fine when called alone, but on loop it has a bug, which allowed me to see that some species the identifier assigned is not correct.
+
+2025.07.07 Built a script that extracts the information of "Strain identifier, species identifier, species name, TaxID" into a log file
+	2025.07.07 - Out of it, I manually built a manually curated list of wrong assignations. (96 species, out of 21193, 0.46%)
+2025.07.08 Built a script that corrects a manually curated list of mis-assignations and the correct ones. It outputs the following:
+
+    Processing FAAT.001 -> ZIFA.001 
+✅ Found genome IDs: ['FAAT.001.0001']
+ Last used index for ZIFA.001 is 0000
+FAAT.001.0001 -> ZIFA.001.0001
+ updating file: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/Replicons/FAAT.001.0001.fna.gz
+      ✅ renamed to: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/Replicons/ZIFA.001.0001.fna.gz 
+ updating file: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/Genes/FAAT.001.0001.nuc
+      ✅ renamed to: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/Genes/ZIFA.001.0001.nuc 
+ updating file: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/Proteins/FAAT.001.0001.prt
+      ✅ renamed to: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/Proteins/ZIFA.001.0001.prt 
+ updating file: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/RNA/FAAT.001.0001.trna
+      ✅ renamed to: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/RNA/ZIFA.001.0001.trna 
+ updating file: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/RNA/FAAT.001.0001.ncrna
+      ✅ renamed to: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/RNA/ZIFA.001.0001.ncrna 
+ updating file: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/RNA/FAAT.001.0001.rrna
+      ✅ renamed to: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/RNA/ZIFA.001.0001.rrna 
+ updating file: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/LSTINFO/FAAT.001.0001.tsv
+      ✅ renamed to: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/LSTINFO/ZIFA.001.0001.tsv 
+ updating file: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/LSTINFO/FAAT.001.0001.gbff.gz
+      ✅ renamed to: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/LSTINFO/ZIFA.001.0001.gbff.gz 
+ updating file: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/LSTINFO/FAAT.001.0001.inf
+      ✅ renamed to: /scratch/hdd2/mgg/GBFF/Z/Zimmermannella/gembases/LSTINFO/ZIFA.001.0001.inf 
+
+
+for species with < 200 strains: 
+	- Run gembasesBuilderGBFF
+	- Run gzipper (to compress GBFF and FNA files
+	- Run buildPangenomes4species
+
+For species with >200 strains:
+	- skani sketch -t 80 --fast -o skani/$species/$species.skanidb Pre-skani/$capital/$species/*.gz; 
+	- skani triangle -t 80 --fast --sparse -o skani/$species/$species.ANI.tb skani/$species/$species.skanidb/*
+	- DendogramPlotter.py -i $species.ANI.tb -o $species.clusters.png -c $species.centroids.tsv -d 0.1 -m ward -f png
+	- run run_gembases_centroids.py -a $capital/$genus/$species/$species.accessions.lst -c $species.centroids.tsv -r gembases.ref -hi gembases.skani.hist -o $output -e e@mail.com -l $output/LOGS/;
+	- run buildPangenomes4species
+	 
+
+
 

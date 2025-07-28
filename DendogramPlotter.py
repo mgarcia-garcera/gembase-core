@@ -166,16 +166,6 @@ def main():
 
         Z = linkage(condensed, method=mthd)
 
-        plt.figure(figsize=(12, 6))
-        dendrogram(Z, labels=df.index.tolist(), leaf_rotation=90)
-        plt.title(f"Hierarchical Clustering Dendrogram ({mthd.capitalize()} Linkage)")
-        plt.xlabel("Genomes")
-        plt.ylabel("Distance (100 - ANI)")
-        plt.tight_layout()
-
-        plt.savefig(plot_path)
-        print(f"Dendrogram saved to {plot_path}")
-
         # Assign clusters based on cut_distance
         cluster_assignments = fcluster(Z, t=cutoff, criterion='distance')
         cluster_dict = {}
@@ -195,6 +185,18 @@ def main():
                 f.write(f"  Centroid: {centroid}\n\n")
 
         print(f"Cluster info saved to {centroid_path}")
+
+        plt.figure(figsize=(12, 6))
+        dendrogram(Z, labels=df.index.tolist(), leaf_rotation=90)
+        plt.title(f"Hierarchical Clustering Dendrogram ({mthd.capitalize()} Linkage)")
+        plt.xlabel("Genomes")
+        plt.ylabel("Distance (100 - ANI)")
+        plt.tight_layout()
+
+        plt.savefig(plot_path)
+        print(f"Dendrogram saved to {plot_path}")
+
+        
         
         
     except Exception as e:
