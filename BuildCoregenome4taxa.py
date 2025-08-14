@@ -42,7 +42,7 @@ def main():
     reference = CF.find_genome_with_most_genes(Listfiles)
     reference_file = str(f"{PRTFOLDER}/{reference}.prt")
     print(f"STEP2: I will use {reference} as my Reference to build the core genome. The genome is in {reference_file}")
-    #define variables for opscan
+    #define variables for synteny
     if args.synteny.lower() == "yes":
             if not args.sum_lim:
                 sum_lim=4
