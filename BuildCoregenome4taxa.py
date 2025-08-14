@@ -74,8 +74,8 @@ def main():
          raise ValueError(f"Could not run opscan to build the pairwise similarity files") 
     #build the core-genome file
     output=CF.orthoFinder(args.output_folder, taxon, args.identity,args.synteny)
-    if output == 0:
-        print(f"Core genome file for {taxon} writen in {args.output_folder}/CoreGenome-{taxon}.{args.identity}.{args.synteny}.lst")
+    if isinstance(output, int):
+        print(f"Core genome file for {taxon} writen in {args.output_folder}/CoreGenome-{taxon}.{args.identity}.{args.synteny}.lst with {output} core-genes")
         for file_path in glob.glob(os.path.join(args.output_folder, "*.shrt")):
              os.remove(file_path)
         for file_path in glob.glob(os.path.join(args.output_folder, "*.synt")):

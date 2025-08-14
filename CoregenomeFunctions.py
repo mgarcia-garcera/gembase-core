@@ -135,32 +135,38 @@ def load_shrt_file(shrt_path):
 
 def tsv_format(input_tsv, output_tsv):
     best_hits = {}
-    print(f"Parsing {input_tsv}....")
-    with open(input_tsv,'r') as input:
-        for line in input:
-            parts=line.strip().split("\t")
-            if len(parts)<4:
+    print(f"Parsing {input_tsv}...")
+
+    with open(input_tsv, 'r') as infile:
+        for line in infile:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 6:  # Changed from <4 to <6 to match unpacking below
                 continue
 
-            querydesc=parts[2].split()
-            querydesc=querydesc[5:]
+            # Extract descriptions after the 5th element
+            parts[2] = " ".join(parts[2].split()[5:])
+            parts[3] = " ".join(parts[3].split()[5:])
 
-            refdesc=parts[3].split()
-            refdesc=refdesc[5:]
-            parts[2]=" ".join(querydesc)
-            parts[3]=" ".join(refdesc)
-            query, target, qdesc, tdesc, pident, qcov = parts
+            try:
+                query, target, qdesc, tdesc, pident_str, qcov_str = parts
+                pident = float(pident_str)
+                qcov = float(qcov_str)
+            except ValueError:
+                continue  # Skip malformed lines
+
+            # Store or update best hit based on pident and qcov
             if query not in best_hits:
-                best_hits[parts]
+                best_hits[query] = (parts, pident, qcov)
             else:
-                best_pident = float(best_hits[query][4])
-                best_qcov = float(best_hits[query][5])
-                if(pident > best_pident) or (pident == best_pident and qcov > best_qcov):
-                    best_hits[query] = parts
-    print(best_hits)
-    with open(output_tsv, 'w') as output:
-        for parts in best_hits.values():        
-            output.write("\t".join(parts) + "\n")
+                _, best_pident, best_qcov = best_hits[query]
+                if pident > best_pident or (pident == best_pident and qcov > best_qcov):
+                    best_hits[query] = (parts, pident, qcov)
+
+    print(f"...Finished. Writing to {output_tsv}")
+
+    with open(output_tsv, 'w') as outfile:
+        for parts, _, _ in best_hits.values():
+            outfile.write("\t".join(parts) + "\n")
 
 def log_step(step_desc, result, stdout, stderr):
     header = f"{step_desc}\n\n\n"
@@ -526,4 +532,4 @@ def orthoFinder(workingfolder, taxon,identity,synteny):
             
             
         joined.to_csv(os.path.join(workingfolder, f"CoreGenome-{taxon}.{identity}.{synteny}.lst"),index=False, header=False, sep="\t")        
-        return(0)
+        return(len(joined))

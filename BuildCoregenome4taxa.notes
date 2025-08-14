@@ -1,0 +1,4 @@
+1. Move the reference DB building outside de loop so it is not needed to build it each time
+2. For fragmented genomes, check when looking for synteny if the next gene is at the start/end of a contig (+/- X positions) and account for it, instead of just following the order of contigs.
+	Based on the observation for ACBA.007, which has 1657 genomes and if using synteny, only 2 genes remain in the core-genome.
+
