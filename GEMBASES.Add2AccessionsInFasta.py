@@ -8,7 +8,7 @@ parser.add_argument("-a", "--add", required=False, default="mmseqs", help="Clust
 
 args = parser.parse_args()
 
-accession_pattern = re.compile(r'⁽>([\w.]+)')
+accession_pattern = re.compile(r'⁽>([^\s]+)')
 
 input_file = args.input
 output_file = args.output
@@ -21,13 +21,10 @@ else:
     with open(input_file, 'r') as infile, open(output_file, 'a') as outfile:
         for line in infile:
             if line.startswith('>'):
-                match = accession_pattern.match(line)
-                if match:
-                    accession = match.group(1)
-                    modified = accession + what2add + line[len(accession):]
-                    outfile.write(modified)
-                else:
-                    outfile.write(line)
+                parts = line.strip().split(maxsplit=1)
+                parts[0] += what2add
+                modified_line = ' '.join(parts) + "\n"
+                outfile.write(modified_line)
             else:
                 outfile.write(line)
 
